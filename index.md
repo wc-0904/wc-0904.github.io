@@ -5,88 +5,227 @@ title: "M:N Green Thread Runtime with Work-Stealing Scheduler"
 
 # M:N Green Thread Runtime with Work-Stealing Scheduler
 
-**Roshni Ramesh and Wasmir Chowdhury** · Carnegie Mellon University
+**Roshni Ramesh (roshnir) and Wasmir Chowdhury (wchowdhu)** · Carnegie Mellon University · 15-418 Spring 2025
 
 ---
 
 ## Summary
 
-We are implementing an M:N threading runtime in C that multiplexes M lightweight green threads across N kernel threads using a work-stealing scheduler, targeting GHC multicore machines and a Raspberry Pi 4. Our runtime implements per-kernel-thread run queues, Chase-Lev work-stealing deques for load balancing, and SIGALRM-based preemption. We evaluate performance against pthreads, Go goroutines, and Java virtual threads (Project Loom) across a variety of workloads.
+We implemented an M:N green thread runtime with a work-stealing scheduler in C++. The system maps M lightweight fibers onto N kernel threads using hand-written x86-64 context switching, per-worker Chase-Lev work-stealing deques, and a WaitForCounter dependency primitive inspired by Naughty Dog's PS4 game engine. We overcame three major technical challenges: a Chase-Lev deque ownership violation causing intermittent lost fibers, a thundering herd problem reducing steal efficiency to 1.5%, and a race condition in the WaitForCounter wakeup path. Our final scheduler achieves **18.3x lower context switch latency** than pthreads, near-linear scaling across compute-bound workloads, and **7.67x speedup on parallel Fibonacci** — within 4% of the Blumofe-Leiserson theoretical bound. We evaluate across seven benchmarks spanning the full range of the T₁/P + O(T∞) bound, from near-linear speedup on embarrassingly parallel workloads to T∞-limited speedup on graph algorithms with short diameter.
 
-## Background
+---
 
-Modern concurrent programs need to manage thousands of lightweight concurrent tasks efficiently. The standard approach (one kernel thread per task via pthreads) does not scale because kernel thread creation is expensive, kernel context switches require a full privilege level change, and the kernel scheduler has no knowledge of application-level task structure.
+## Background and Motivation
 
-M:N threading addresses this by maintaining a small fixed pool of N kernel threads and multiplexing M lightweight green threads on top of them entirely in userspace. The kernel sees only N threads; the runtime manages the M green threads invisibly.
+### The M:N Threading Model
 
-**Green thread context switches are roughly 10x cheaper than kernel thread context switches**, since they only save/restore callee-saved registers and the stack pointer with no kernel involvement.
+Traditional 1:1 threading maps each application thread directly to a kernel thread. When a thread blocks waiting for a dependency, the kernel thread sleeps — wasting a core. For workloads with many fine-grained dependencies, this is expensive. The M:N model decouples execution contexts (fibers) from kernel threads (workers). M fibers share N kernel threads. When a fiber blocks, the kernel thread immediately picks up another runnable fiber. This keeps all N cores fully utilized even when many fibers are waiting.
 
-### Scheduling Design
+### Work Stealing and the Blumofe-Leiserson Bound
 
-A naive approach uses a single global queue protected by a lock, but this creates a sequential bottleneck. Our approach gives each kernel thread its own private run queue, implemented as a **Chase-Lev work-stealing deque**:
+Blumofe and Leiserson (1999) proved that a randomized work-stealing scheduler achieves expected execution time **T₁/P + O(T∞)** where T₁ is total work, P is processors, and T∞ is the critical path length. This is optimal — no scheduler can do better than T₁/P (bounded by total work) or T∞ (bounded by the longest dependency chain). Work stealing achieves this without global coordination: each worker maintains a local deque, pushing and popping from one end while idle workers steal from the other end of random victims.
 
-- The **owner** schedules from the front of its own queue with no contention
-- When a queue is empty, the kernel thread **steals** from the back of another thread's queue
-- This minimizes contention between owner and thief
+### Naughty Dog Inspiration
 
-This is the same fundamental design used by Go's goroutine scheduler, Java's ForkJoinPool, and the Cilk runtime.
+Midway through our project we discovered Christian Gyrling's GDC 2015 talk describing how Naughty Dog parallelized their PS4 engine for *The Last of Us Remastered*. Their system uses the same primitives we had independently built: lightweight fibers, a WaitForCounter dependency primitive, and worker threads that pick up new fibers when the current fiber blocks. Their key insight: instead of blocking a thread waiting for job dependencies, park the fiber and run something else. However, Naughty Dog's original system used a single shared priority queue with no work stealing. Our design replaces this with per-worker Chase-Lev deques and work stealing, delivering better performance on heterogeneous workloads where job costs are unpredictable.
 
-## The Challenge
+---
 
-**Synchronization in work stealing** -- the owner of a queue accesses the front while a thief accesses the back simultaneously. Getting this lock-free correctly without data races requires careful reasoning about memory ordering. A bug here causes silent state corruption that is hard to reproduce and diagnose.
+## Implementation
 
-**Preemption interaction with scheduler state** -- SIGALRM fires asynchronously on a kernel thread that may be in the middle of a scheduler operation. The signal handler must safely preempt the current green thread without corrupting the run queue or leaving locks held.
+### Context Switch
 
-**Blocking syscall problem** -- if a green thread calls a blocking syscall, it blocks its entire kernel thread, starving all other green threads on that kernel thread. Addressing this with `io_uring` requires integrating an async IO completion loop into the scheduler.
+We implement context switching in hand-written x86-64 assembly. Three primitives — `get_context`, `set_context`, `swap_context` — save and restore the 14 callee-saved registers: `rbx`, `rbp`, `r12`–`r15`, `rip`, and `rsp`. We deliberately avoid `ucontext_t` — Linux's implementation saves signal masks and floating-point state, adding ~1800ns of unnecessary overhead. Our implementation costs **~106ns per switch**.
 
-**Memory locality** -- when work stealing migrates a green thread from one kernel thread to another, the thread's stack data is no longer in the stealing core's cache. Measuring and characterizing this tradeoff is one of our evaluation goals.
+### Chase-Lev Work-Stealing Deque
 
-**Bare metal port** -- on the Raspberry Pi 4 we lose all Linux primitives. We must implement SMP boot, ARM64 context switching in assembly, hardware timer programming for preemption, and a minimal memory allocator.
+Each worker maintains a Chase-Lev deque backed by a dynamically growable circular buffer. Access is asymmetric: the owner calls `pushBottom` and `popBottom` from one end, while thieves call `steal` from the other. The key memory ordering invariants: `pushBottom` stores the element then does a release-store on bottom; `popBottom` decrements bottom with a `seq_cst` fence before loading top; `steal` does an acquire-load on top, `seq_cst` fence, acquire-load on bottom, then a CAS on top.
 
-## Goals and Deliverables
+### Worker Loop
 
-### Plan to Achieve (Core)
+`scheduler_init(N)` allocates N workers each with a Chase-Lev deque of 1024 slots. `scheduler_run(N)` spawns N-1 pthreads and runs the worker loop on the main thread. The loop pops from the local deque, falls back to stealing with exponential backoff, runs the fiber via `swap_context`, and handles wakeups and completions. Termination uses monotonic `total_spawned` and `total_done` counters rather than a mutable `active_fibers` count — avoiding a race where the count oscillates through zero while fibers are still in flight.
 
-- Fully working M:N threading runtime in C on GHC machines: green thread creation and context switching via `ucontext`, per-kernel-thread run queues with fine-grained locking, Chase-Lev work-stealing, and SIGALRM-based preemption
-- Green-thread-aware mutex and condition variable primitives that yield the kernel thread rather than blocking it
-- Comprehensive benchmark suite measuring throughput, scheduling latency, work-stealing rate, and preemption overhead
-- Direct performance comparison against pthreads across CPU-bound, short-lived thread, and producer-consumer workloads
-- Speedup graphs showing performance scaling from 1 to 8 kernel threads on GHC machines
+### WaitForCounter
 
-### Hope to Achieve (Reach Goals)
+`counter_t` holds an atomic count and a waiting fiber pointer. `spawn_with_counter(func, args, c)` associates a child fiber with counter `c`. When the child completes, it decrements `c`. `wait_for_counter(c, 0)` suspends the current fiber until `c` reaches zero, freeing the worker thread to run other fibers immediately. The wakeup path stores the parent pointer in the child's `wakeup_target` field, and the worker loop pushes the woken parent onto its own deque after `swap_context` returns — ensuring the parent only becomes visible to the scheduler after the child has fully returned to the worker loop.
 
-- Benchmark comparison against Go goroutines and Java virtual threads (Project Loom)
-- `io_uring` integration for true async IO without blocking kernel threads
-- Bare metal port to Raspberry Pi 4 with ARM64 assembly context switch, ARM generic timer for preemption, and a bump allocator
+---
 
-### If Things Go Slower
+## Technical Challenges
 
-- Drop `io_uring` and Pi port; focus on thorough Linux evaluation with deeper analysis of stealing behavior and cache miss profiling with `perf`
-- If work stealing proves too buggy, fall back to per-kernel-thread queues without stealing and analyze the load imbalance cost
+### Challenge 1: Chase-Lev Ownership Violation
 
-## Schedule
+Our original `spawn` used a global round-robin counter to distribute fibers across all workers. A parent fiber running on worker 3 calling `spawn_with_counter` 16 times would push children onto workers 0 through 7 — meaning worker 3's fiber was calling `pushBottom` on worker 5's deque while worker 5 simultaneously called `popBottom`. This violated the Chase-Lev single-owner invariant and caused intermittent lost fibers (~3 in 20 runs hung forever).
 
-| Week | Roshni | Wasmir |
-|------|--------|--------|
-| **Mar 25** -- Foundation | Repo setup, Makefile, green thread struct, stack allocation | `ucontext` API, single green thread context switch, `test_basic` passing |
-| **Apr 1** -- Single KThread Scheduler | Per-KThread run queue, enqueue/dequeue, instrumentation | Scheduler loop, cooperative multi-thread execution, yielding |
-| **Apr 7** -- Parallelism & Stealing | Extend to N kernel threads, verify correctness | Work-stealing implementation, `try_steal`, imbalanced workload test |
-| **Apr 14** -- Milestone | *Both: milestone report, project page update, preliminary throughput graphs* | |
-| **Apr 14** -- Preemption & Sync | SIGALRM preemption, signal masking | Green thread mutex/condvar, producer-consumer test |
-| **Apr 21** -- Eval & Reach Goals | Full benchmark suite, Go/Loom comparisons | `io_uring` integration or bare metal Pi boot |
-| **Apr 28** -- Writeup & Poster | *Both: final report, poster, source code cleanup* | |
+**Fix:** Always push onto the current worker's own deque. This restores the single-owner invariant and maximizes cache locality. Work stealing becomes the sole redistribution mechanism.
 
-## Platform
+### Challenge 2: Steal Contention (Thundering Herd)
 
-**GHC lab machines** (8 cores, x86-64, Linux) -- primary development and evaluation platform. C gives us direct control over memory layout, assembly integration, and signal handling.
+With all fibers starting on one worker's deque, we measured 58,597 steal attempts with only 900 successes (1.5% success rate) at N=8. All 7 idle workers scanned from worker 0 simultaneously, causing repeated CAS failures.
 
-**Raspberry Pi 4** (4 cores, ARM Cortex-A72) -- bare metal port target. Both team members have prior bare metal ARM experience from 18-349.
+**Fix:** Randomized victim selection (start each scan from a random offset) and exponential backoff with jitter (delay doubles on failure, caps at 1024 units, resets on success). Result: 13x reduction in wasted steal attempts, success rate improved from 1.5% to 21.0% at N=8.
+
+| N | Attempts (before) | Attempts (after) | Success rate (before) | Success rate (after) |
+|---|---|---|---|---|
+| 4 | 16,689 | 1,707 | 4.6% | 45.2% |
+| 8 | 58,597 | 4,421 | 1.5% | 21.0% |
+
+### Challenge 3: WaitForCounter Liveness Tracking
+
+Three failed approaches all tracked "currently runnable fibers," a quantity that legitimately oscillates through zero when parents park and wake. Each attempt added atomic operations on every fiber event while still failing to close the termination window. The final design uses monotonic counters: exactly two atomic increments per fiber lifetime (one at spawn, one at completion), and the termination condition is a simple comparison of two monotonically increasing values.
+
+---
+
+## Results
+
+### Experimental Setup
+
+GHC experiments: ghc28.ghc.andrew.cmu.edu (Intel Core i9-9900K, 8 physical cores, 3.6 GHz, 16MB shared L3 cache). PSC experiments: Bridges-2 node r142 (AMD EPYC 7742, 2 sockets × 64 cores = 128 physical cores, NUMA distance local=10 cross=32). All timing uses `clock_gettime(CLOCK_MONOTONIC)`.
+
+### Context Switch Latency
+
+| | Total time | Per switch |
+|---|---|---|
+| pthreads | 99.4 ms | 1940.9 ns |
+| fibers | 5.4 ms | 106.3 ns |
+| **speedup** | **18.3x** | **18.3x** |
+
+### All Workloads on GHC (N=1 to 8)
+
+![Speedup across all GHC workloads](speedup_ghc.png)
+
+### Balanced Workload
+
+1024 fibers with identical 100K-iteration busy loops. All fibers originate on worker 0's deque; work stealing redistributes them. With stealing disabled, throughput is flat at ~7,600 fibers/s regardless of N — all fibers stay on worker 0 and other workers sit idle. Work stealing is not merely an optimization; it is the mechanism that enables parallel execution when tasks originate from a single source.
+
+### Imbalanced Workload
+
+1024 fibers on a single worker's deque. 10% heavy (1M iterations), 90% light (10K iterations).
+
+| N | Time (ms) | Throughput (fibers/s) | Speedup | Steals | Attempts | Success rate |
+|---|---|---|---|---|---|---|
+| 1 | 201.0 | 5,095 | 1.0x | 0 | 0 | — |
+| 2 | 100.1 | 9,977 | 1.96x | 521 | 540 | 96.5% |
+| 4 | 53.1 | 18,984 | 3.73x | 771 | 1,707 | 45.2% |
+| 8 | 27.6 | 37,026 | 7.26x | 904 | 4,421 | 20.4% |
+
+At N=8, per-worker cycle counts vary by less than 8%, confirming near-optimal load balance achieved entirely at runtime through work stealing.
+
+### Parallel Fibonacci
+
+fib(40), sequential cutoff at 20, artificial 500K-iteration leaf work to make tasks compute-bound.
+
+| N | Time (ms) | Speedup | Steals |
+|---|---|---|---|
+| 1 | 11,274 | 1.0x | 0 |
+| 2 | 5,713 | 1.97x | 13 |
+| 4 | 2,908 | 3.88x | 39 |
+| 8 | 1,470 | 7.67x | 129 |
+
+**7.67x speedup at N=8** versus the theoretical maximum of 8x — within 4% of the Blumofe-Leiserson T₁/P bound.
+
+### Heat Diffusion
+
+512×512 grid, 400 timesteps, 64 horizontal strips. The middle third of strips perform 4× more computation than the outer strips, creating persistent load imbalance.
+
+| N | Variable (stealing on) | Variable (stealing off) |
+|---|---|---|
+| 1 | 750ms / 1.0x | 750ms / 1.0x |
+| 2 | 381ms / 1.97x | 744ms / 1.00x |
+| 4 | 195ms / 3.85x | 759ms / 0.98x |
+| 8 | 103ms / 7.21x | 772ms / 0.96x |
+
+The 7.5x gap between stealing=on and stealing=off at N=8 is our most direct demonstration that work stealing is essential for heterogeneous workloads.
+
+![Heat diffusion simulation](heat2.gif)
+
+### Parallel BFS
+
+1M nodes, degree=16 random graph. Sequential BFS: 163.78ms, 8 levels.
+
+| N | Time (ms) | Speedup vs sequential |
+|---|---|---|
+| 1 (parallel) | 312.41 | 0.52x |
+| 2 | 183.04 | 0.89x |
+| 4 | 108.73 | 1.51x |
+| 8 | 83.76 | 1.96x |
+
+BFS has only 8 levels — T∞ = 8 barrier crossings regardless of worker count. This directly validates the T₁/P + O(T∞) bound: T∞ is large relative to T₁/P so speedup is fundamentally capped at ~2x.
+
+### N-Queens
+
+N-Queens has highly irregular branching. With depth=1 (14 tasks), insufficient parallelism for 8 workers. With depth=2 (156 tasks), work stealing dynamically balances the irregular subtrees and achieves **7.22x speedup**. Depth=3 (1364 tasks) gives no further improvement — task granularity is fine enough that scheduling overhead offsets any additional load balancing benefit.
+
+### Parallel Mergesort
+
+5M integers, sequential cutoff at 5,000 elements.
+
+| N | Time (ms) | Speedup | Steals |
+|---|---|---|---|
+| 1 | 637.6 | 1.0x | 0 |
+| 2 | 342.4 | 1.86x | 1 |
+| 4 | 203.9 | 3.13x | 13 |
+| 8 | 164.1 | 3.88x | 58 |
+
+3.88x at N=8 — the bottleneck is the sequential merge step at each WaitForCounter barrier. The root merge alone is O(N) and cannot be parallelized.
+
+### Cache Migration Penalty
+
+| | Avg cycles per fiber |
+|---|---|
+| Local fibers | 393,656 |
+| Stolen fibers | 397,421 |
+| Difference | 3,765 cycles (~0.96%) |
+
+Stolen fibers take ~1% longer on GHC's shared 16MB L3 cache.
+
+---
+
+## PSC Results: High-Core-Count Scaling
+
+Experiments on Bridges-2 (AMD EPYC 7742, 2 sockets × 64 cores = 128 physical cores) reveal a consistent pattern: **near-linear scaling within a single socket (N=1 to N=64), followed by degradation or plateau when crossing to the second socket (N=64 to N=128)**.
+
+### BFS on PSC
+
+| N | Time (ms) | Speedup vs sequential |
+|---|---|---|
+| 1 | 283 | 0.74x |
+| 8 | 287 | 0.73x |
+| 32 | 215 | 0.97x |
+| 64 | 147 | 1.42x |
+| 128 | 130 | 1.61x |
+
+### The NUMA Effect
+
+Fibonacci and Heat diffusion regress at N=128 because their tasks are small enough that cross-socket steal overhead is a significant fraction of task time. N-Queens plateaus because tasks are larger, making the penalty relatively smaller. BFS is T∞-limited so the NUMA effect is secondary. The fix is NUMA-aware stealing — preferring same-socket victims before falling back to cross-socket steals.
+
+---
+
+## Analysis
+
+Speedup is limited by three distinct factors depending on the workload:
+
+**Compute-bound, short critical path (Fibonacci, N-Queens, balanced fibers):** The limit is the Blumofe-Leiserson T∞ term. Our Fibonacci result of 7.67x at N=8 versus the theoretical 8x maximum confirms the scheduler operates within 4% of optimal.
+
+**Long critical path (BFS with 8 sequential levels):** T∞ dominates and speedup is capped at ~2x regardless of worker count. Adding more workers cannot parallelize the barrier between BFS levels.
+
+**High worker counts on PSC (N=64 to N=128):** The limit is NUMA penalty on cross-socket steal attempts. This directly motivates NUMA-aware stealing as future work.
+
+**Steal contention on GHC (N=8):** Before our backoff optimization, 98.5% of steal attempts were wasted on thundering herd CAS failures. Randomized victim selection + exponential backoff reduced wasted attempts by 13x.
+
+---
+
+## Work Breakdown
+
+- **Roshni (50%):** Chase-Lev deque, performance counters, WaitForCounter dependency system
+- **Wasmir (50%):** Context switching assembly, N:1 scheduler implementation, unit testing, M:N worker infrastructure
+
+---
 
 ## References
 
+- [graphitemaster.github.io/fibers](https://graphitemaster.github.io/fibers/) — primary implementation reference
 - Blumofe & Leiserson 1999, *"Scheduling Multithreaded Computations by Work Stealing"*
 - Chase & Lev 2005, *"Dynamic Circular Work-Stealing Deque"*
+- [Christian Gyrling, GDC 2015](https://media.gdcvault.com/gdc2015/presentations/Gyrling_Christian_Parallelizing_The_Naughty.pdf) — *"Parallelizing the Naughty Dog Engine Using Fibers"*
 - Go scheduler design document (Dmitry Vyukov)
-- Anderson et al. 1992, *"Scheduler Activations"*
-- BCM2711 ARM Peripherals datasheet and ARM Cortex-A72 TRM
-- [raspberry-pi-os](https://github.com/s-matyukevich/raspberry-pi-os) bare metal tutorial
