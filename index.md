@@ -11,7 +11,7 @@ title: "M:N Green Thread Runtime with Work-Stealing Scheduler"
 
 ## Summary
 
-We implemented an M:N green thread runtime with a work-stealing scheduler in C++. The system maps M lightweight fibers onto N kernel threads using hand-written x86-64 context switching, per-worker Chase-Lev work-stealing deques, and a WaitForCounter dependency primitive inspired by Naughty Dog's PS4 game engine. We overcame three major technical challenges: a Chase-Lev deque ownership violation causing intermittent lost fibers, a thundering herd problem reducing steal efficiency to 1.5%, and a race condition in the WaitForCounter wakeup path. Our final scheduler achieves **18.3x lower context switch latency** than pthreads, near-linear scaling across compute-bound workloads, and **7.67x speedup on parallel Fibonacci** — within 4% of the Blumofe-Leiserson theoretical bound. We evaluate across seven benchmarks spanning the full range of the T₁/P + O(T∞) bound, from near-linear speedup on embarrassingly parallel workloads to T∞-limited speedup on graph algorithms with short diameter.
+We implemented an M:N green thread runtime with a work-stealing scheduler in C++. The system maps M lightweight fibers onto N kernel threads using hand-written x86-64 context switching, per-worker Chase-Lev work-stealing deques, and a WaitForCounter dependency primitive inspired by Naughty Dog's PS4 game engine. We overcame three major technical challenges: a Chase-Lev deque ownership violation causing intermittent lost fibers, a thundering herd problem reducing steal efficiency to 1.5%, and a race condition in the WaitForCounter wakeup path. Our final scheduler achieves **18.3x lower context switch latency** than pthreads, near-linear scaling across compute-bound workloads, and **7.67x speedup on parallel Fibonacci**, within 4% of the Blumofe-Leiserson theoretical bound. We evaluate across seven benchmarks spanning the full range of the T₁/P + O(T∞) bound, from near-linear speedup on embarrassingly parallel workloads to T∞-limited speedup on graph algorithms with short diameter.
 
 ---
 
@@ -19,11 +19,11 @@ We implemented an M:N green thread runtime with a work-stealing scheduler in C++
 
 ### The M:N Threading Model
 
-Traditional 1:1 threading maps each application thread directly to a kernel thread. When a thread blocks waiting for a dependency, the kernel thread sleeps — wasting a core. For workloads with many fine-grained dependencies, this is expensive. The M:N model decouples execution contexts (fibers) from kernel threads (workers). M fibers share N kernel threads. When a fiber blocks, the kernel thread immediately picks up another runnable fiber. This keeps all N cores fully utilized even when many fibers are waiting.
+Traditional 1:1 threading maps each application thread directly to a kernel thread. When a thread blocks waiting for a dependency, the kernel thread sleeps, wasting a core. For workloads with many fine-grained dependencies, this is expensive. The M:N model decouples execution contexts (fibers) from kernel threads (workers). M fibers share N kernel threads. When a fiber blocks, the kernel thread immediately picks up another runnable fiber. This keeps all N cores fully utilized even when many fibers are waiting.
 
 ### Work Stealing and the Blumofe-Leiserson Bound
 
-Blumofe and Leiserson (1999) proved that a randomized work-stealing scheduler achieves expected execution time **T₁/P + O(T∞)** where T₁ is total work, P is processors, and T∞ is the critical path length. This is optimal — no scheduler can do better than T₁/P (bounded by total work) or T∞ (bounded by the longest dependency chain). Work stealing achieves this without global coordination: each worker maintains a local deque, pushing and popping from one end while idle workers steal from the other end of random victims.
+Blumofe and Leiserson (1999) proved that a randomized work-stealing scheduler achieves expected execution time **T₁/P + O(T∞)** where T₁ is total work, P is processors, and T∞ is the critical path length. This is optimal, no scheduler can do better than T₁/P (bounded by total work) or T∞ (bounded by the longest dependency chain). Work stealing achieves this without global coordination: each worker maintains a local deque, pushing and popping from one end while idle workers steal from the other end of random victims.
 
 ### Naughty Dog Inspiration
 
@@ -35,7 +35,7 @@ Midway through our project we discovered Christian Gyrling's GDC 2015 talk descr
 
 ### Context Switch
 
-We implement context switching in hand-written x86-64 assembly. Three primitives — `get_context`, `set_context`, `swap_context` — save and restore the 14 callee-saved registers: `rbx`, `rbp`, `r12`–`r15`, `rip`, and `rsp`. We deliberately avoid `ucontext_t` — Linux's implementation saves signal masks and floating-point state, adding ~1800ns of unnecessary overhead. Our implementation costs **~106ns per switch**.
+We implement context switching in hand-written x86-64 assembly. Three primitives, `get_context`, `set_context`, `swap_context`, save and restore the 14 callee-saved registers: `rbx`, `rbp`, `r12`–`r15`, `rip`, and `rsp`. We deliberately avoid `ucontext_t`, Linux's implementation saves signal masks and floating-point state, adding ~1800ns of unnecessary overhead. Our implementation costs **~106ns per switch**.
 
 ### Chase-Lev Work-Stealing Deque
 
@@ -43,11 +43,11 @@ Each worker maintains a Chase-Lev deque backed by a dynamically growable circula
 
 ### Worker Loop
 
-`scheduler_init(N)` allocates N workers each with a Chase-Lev deque of 1024 slots. `scheduler_run(N)` spawns N-1 pthreads and runs the worker loop on the main thread. The loop pops from the local deque, falls back to stealing with exponential backoff, runs the fiber via `swap_context`, and handles wakeups and completions. Termination uses monotonic `total_spawned` and `total_done` counters rather than a mutable `active_fibers` count — avoiding a race where the count oscillates through zero while fibers are still in flight.
+`scheduler_init(N)` allocates N workers each with a Chase-Lev deque of 1024 slots. `scheduler_run(N)` spawns N-1 pthreads and runs the worker loop on the main thread. The loop pops from the local deque, falls back to stealing with exponential backoff, runs the fiber via `swap_context`, and handles wakeups and completions. Termination uses monotonic `total_spawned` and `total_done` counters rather than a mutable `active_fibers` count, avoiding a race where the count oscillates through zero while fibers are still in flight.
 
 ### WaitForCounter
 
-`counter_t` holds an atomic count and a waiting fiber pointer. `spawn_with_counter(func, args, c)` associates a child fiber with counter `c`. When the child completes, it decrements `c`. `wait_for_counter(c, 0)` suspends the current fiber until `c` reaches zero, freeing the worker thread to run other fibers immediately. The wakeup path stores the parent pointer in the child's `wakeup_target` field, and the worker loop pushes the woken parent onto its own deque after `swap_context` returns — ensuring the parent only becomes visible to the scheduler after the child has fully returned to the worker loop.
+`counter_t` holds an atomic count and a waiting fiber pointer. `spawn_with_counter(func, args, c)` associates a child fiber with counter `c`. When the child completes, it decrements `c`. `wait_for_counter(c, 0)` suspends the current fiber until `c` reaches zero, freeing the worker thread to run other fibers immediately. The wakeup path stores the parent pointer in the child's `wakeup_target` field, and the worker loop pushes the woken parent onto its own deque after `swap_context` returns, ensuring the parent only becomes visible to the scheduler after the child has fully returned to the worker loop.
 
 ---
 
@@ -55,7 +55,7 @@ Each worker maintains a Chase-Lev deque backed by a dynamically growable circula
 
 ### Challenge 1: Chase-Lev Ownership Violation
 
-Our original `spawn` used a global round-robin counter to distribute fibers across all workers. A parent fiber running on worker 3 calling `spawn_with_counter` 16 times would push children onto workers 0 through 7 — meaning worker 3's fiber was calling `pushBottom` on worker 5's deque while worker 5 simultaneously called `popBottom`. This violated the Chase-Lev single-owner invariant and caused intermittent lost fibers (~3 in 20 runs hung forever).
+Our original `spawn` used a global round-robin counter to distribute fibers across all workers. A parent fiber running on worker 3 calling `spawn_with_counter` 16 times would push children onto workers 0 through 7, meaning worker 3's fiber was calling `pushBottom` on worker 5's deque while worker 5 simultaneously called `popBottom`. This violated the Chase-Lev single-owner invariant and caused intermittent lost fibers (~3 in 20 runs hung forever).
 
 **Fix:** Always push onto the current worker's own deque. This restores the single-owner invariant and maximizes cache locality. Work stealing becomes the sole redistribution mechanism.
 
